@@ -133,24 +133,116 @@ def _read_csv(path: Path) -> tuple[list[str], Iterator[list[str]]]:
 
 
 def _read_xlsx(path: Path) -> tuple[list[str], Iterator[list[str]]]:
-    try:
-        from openpyxl import load_workbook
-    except ImportError:
-        sys.exit("error: reading .xlsx requires openpyxl. install with: pip install openpyxl  (or use uvx fixphone, which handles deps)")
-    wb = load_workbook(filename=str(path), read_only=True, data_only=True)
-    ws = wb.active
-    rows = ws.iter_rows(values_only=True)
-    try:
-        header_row = next(rows)
-    except StopIteration:
-        header_row = ()
-    header = ["" if v is None else str(v) for v in header_row]
+    """Read an .xlsx with the stdlib only — no openpyxl.
 
-    def gen() -> Iterator[list[str]]:
-        for r in rows:
-            yield ["" if v is None else str(v) for v in r]
+    .xlsx is a ZIP of XML. We pull the shared-strings table and the first
+    worksheet, walk rows in document order, and expand each cell to its
+    string value. Good enough for finding phone numbers — we don't care
+    about formatting, formulas, styles, or types beyond "what would the
+    user see in the cell".
+    """
+    import xml.etree.ElementTree as ET
+    import zipfile
 
-    return header, gen()
+    NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+
+    def col_letters_to_index(s: str) -> int:
+        n = 0
+        for ch in s:
+            if not ("A" <= ch <= "Z"):
+                break
+            n = n * 26 + (ord(ch) - ord("A") + 1)
+        return n - 1
+
+    try:
+        zf = zipfile.ZipFile(str(path))
+    except zipfile.BadZipFile:
+        sys.exit(f"error: {path} is not a valid .xlsx (not a zip archive)")
+
+    with zf:
+        names = set(zf.namelist())
+
+        # Shared strings table (optional).
+        shared: list[str] = []
+        if "xl/sharedStrings.xml" in names:
+            with zf.open("xl/sharedStrings.xml") as f:
+                for _, si in ET.iterparse(f, events=("end",)):
+                    if si.tag == NS + "si":
+                        # Concatenate all <t> descendants (handles rich-text runs).
+                        text_parts = [t.text or "" for t in si.iter(NS + "t")]
+                        shared.append("".join(text_parts))
+                        si.clear()
+
+        # Pick the first worksheet by walking the workbook part.
+        sheet_path = "xl/worksheets/sheet1.xml"
+        if "xl/workbook.xml" in names:
+            with zf.open("xl/workbook.xml") as f:
+                wb_root = ET.parse(f).getroot()
+            sheets = wb_root.find(NS + "sheets")
+            if sheets is not None and len(sheets) > 0:
+                first = sheets[0]
+                # Resolve r:id → target via workbook rels.
+                rid = first.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+                if rid and "xl/_rels/workbook.xml.rels" in names:
+                    with zf.open("xl/_rels/workbook.xml.rels") as rf:
+                        rels = ET.parse(rf).getroot()
+                    for rel in rels:
+                        if rel.get("Id") == rid:
+                            target = rel.get("Target", "")
+                            sheet_path = "xl/" + target.lstrip("/").removeprefix("xl/").lstrip("/")
+                            break
+
+        if sheet_path not in names:
+            # Fallback: first thing under xl/worksheets/.
+            cands = sorted(n for n in names if n.startswith("xl/worksheets/") and n.endswith(".xml"))
+            if not cands:
+                sys.exit(f"error: no worksheets found in {path}")
+            sheet_path = cands[0]
+
+        def cell_text(c) -> str:
+            t = c.get("t")
+            if t == "inlineStr":
+                is_el = c.find(NS + "is")
+                if is_el is None:
+                    return ""
+                return "".join(tt.text or "" for tt in is_el.iter(NS + "t"))
+            v = c.find(NS + "v")
+            if v is None or v.text is None:
+                return ""
+            val = v.text
+            if t == "s":
+                try:
+                    return shared[int(val)]
+                except (ValueError, IndexError):
+                    return ""
+            if t == "b":
+                return "TRUE" if val == "1" else "FALSE"
+            return val
+
+        def iter_rows_from_sheet() -> Iterator[list[str]]:
+            with zf.open(sheet_path) as f:
+                for _, row in ET.iterparse(f, events=("end",)):
+                    if row.tag != NS + "row":
+                        continue
+                    out: list[str] = []
+                    for c in row.findall(NS + "c"):
+                        ref = c.get("r", "")
+                        idx = col_letters_to_index(ref) if ref else len(out)
+                        while len(out) < idx:
+                            out.append("")
+                        out.append(cell_text(c))
+                    row.clear()
+                    yield out
+
+        # We need to fully materialize so we can close the zip after the generator
+        # finishes — iterparse holds the stream open. For our use case (phone
+        # validation on staff spreadsheets) row count is tiny; this is fine.
+        all_rows = list(iter_rows_from_sheet())
+
+    if not all_rows:
+        return [], iter(())
+    header = all_rows[0]
+    return header, iter(all_rows[1:])
 
 
 def read_table(path: Path) -> tuple[list[str], Iterator[list[str]]]:

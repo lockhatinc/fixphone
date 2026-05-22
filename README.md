@@ -24,7 +24,7 @@ or
 pipx run fixphone contacts.xlsx
 ```
 
-That's it. Works on Windows, macOS, and Linux. The first run pulls the tool and its lone dependency (`openpyxl`, only used for `.xlsx`); subsequent runs are instant.
+That's it. Works on Windows, macOS, and Linux. Zero runtime dependencies — `.xlsx` is parsed with the stdlib.
 
 Don't have `uv` or `pipx`?
 

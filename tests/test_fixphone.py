@@ -152,6 +152,77 @@ def test_scan_csv_all_columns_does_not_flag_non_phone_values(tmp_path: Path):
     assert busted == [], f"non-phone all-columns scan produced false positives: {busted}"
 
 
+def _write_minimal_xlsx(path: Path, rows: list[list[str]]) -> None:
+    """Hand-roll a minimal .xlsx so we can test the stdlib reader without
+    depending on openpyxl (which is exactly what we're avoiding)."""
+    import io
+    import zipfile
+
+    NS = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+
+    # Build shared strings.
+    strings: list[str] = []
+    index: dict[str, int] = {}
+    for r in rows:
+        for v in r:
+            if v not in index:
+                index[v] = len(strings)
+                strings.append(v)
+
+    def xml_escape(s: str) -> str:
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    sst_items = "".join(f"<si><t xml:space=\"preserve\">{xml_escape(s)}</t></si>" for s in strings)
+    sst = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><sst {NS} count="{len(strings)}" uniqueCount="{len(strings)}">{sst_items}</sst>'
+
+    def col_letter(i: int) -> str:
+        s = ""
+        i += 1
+        while i:
+            i, rem = divmod(i - 1, 26)
+            s = chr(ord("A") + rem) + s
+        return s
+
+    sheet_rows = []
+    for ri, row in enumerate(rows, start=1):
+        cells = "".join(
+            f'<c r="{col_letter(ci)}{ri}" t="s"><v>{index[v]}</v></c>'
+            for ci, v in enumerate(row)
+        )
+        sheet_rows.append(f"<row r=\"{ri}\">{cells}</row>")
+    sheet = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet {NS}><sheetData>{"".join(sheet_rows)}</sheetData></worksheet>'
+
+    content_types = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>'
+    root_rels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
+    workbook = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook {NS} xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>'
+    workbook_rels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/></Relationships>'
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", root_rels)
+        z.writestr("xl/workbook.xml", workbook)
+        z.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        z.writestr("xl/sharedStrings.xml", sst)
+        z.writestr("xl/worksheets/sheet1.xml", sheet)
+
+
+def test_scan_xlsx_stdlib_reader(tmp_path: Path):
+    p = tmp_path / "sample.xlsx"
+    _write_minimal_xlsx(p, [
+        ["Name", "ID Number", "Mobile"],
+        ["Alice", "8001015009087", "082 123 4567"],
+        ["Bob",   "8001015009087", "082 123 456"],     # busted
+        ["Cara",  "9999999999999", "+44 20 7946 0958"], # busted (foreign)
+    ])
+    busted, _, cols = scan(p, columns=None, all_columns=False)
+    assert cols == ["Mobile"]
+    reasons = [(b.row, b.column, b.reason) for b in busted]
+    assert reasons == [
+        (3, "Mobile", "wrong-length:9-digits"),
+        (4, "Mobile", "foreign-country-code:+44"),
+    ], reasons
+
+
 def test_scan_csv_explicit_column(tmp_path: Path):
     p = _write_csv(tmp_path, [
         ["Name", "Office", "Home"],

@@ -17,9 +17,7 @@ classifiers = [
   "Operating System :: OS Independent",
   "Topic :: Office/Business",
 ]
-dependencies = [
-  "openpyxl>=3.1; python_version >= '3.9'",
-]
+dependencies = []
 
 [project.scripts]
 fixphone = "fixphone:main"
