@@ -262,5 +262,50 @@ def main(argv: list[str] | None = None) -> int:
     return 1 if busted else 0
 
 
+def _is_frozen() -> bool:
+    """True when running from a PyInstaller-built exe."""
+    return getattr(sys, "frozen", False)
+
+
+def _pause_if_interactive() -> None:
+    """When launched by double-click / drag-and-drop / Send-To, the console
+    window disappears the moment the process exits. Pause so the user can
+    read the output. Skipped when redirected (CI, piping, --quiet flag of a
+    shell user)."""
+    if not sys.stdin or not sys.stdin.isatty():
+        return
+    try:
+        input("\npress Enter to close...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+def _frozen_entry() -> int:
+    """Entry used by the PyInstaller exe. Adds drag-and-drop ergonomics:
+    if no file was passed, prompt for one; on completion, pause."""
+    argv = sys.argv[1:]
+    if not argv:
+        try:
+            entered = input("drag a .csv or .xlsx file onto this window, or type a path, then Enter: ").strip().strip('"')
+        except (EOFError, KeyboardInterrupt):
+            entered = ""
+        if not entered:
+            print("no file given. exiting.")
+            _pause_if_interactive()
+            return 2
+        argv = [entered]
+    try:
+        rc = main(argv)
+    except SystemExit as e:
+        rc = int(e.code) if isinstance(e.code, int) else (0 if e.code is None else 1)
+    except Exception as e:  # noqa: BLE001
+        print(f"error: {e}", file=sys.stderr)
+        rc = 1
+    _pause_if_interactive()
+    return rc
+
+
 if __name__ == "__main__":
+    if _is_frozen() or len(sys.argv) <= 1:
+        raise SystemExit(_frozen_entry())
     raise SystemExit(main())

@@ -2,7 +2,17 @@
 
 Find busted South African telephone numbers in CSV and Excel files. One command, no setup.
 
-## Run it (no install)
+## For Windows staff: just download the exe
+
+[**Download `fixphone.exe` from the latest release.**](https://github.com/lockhatinc/fixphone/releases) No install, no Python, no admin rights.
+
+- **Drag-and-drop**: drag a `.csv` or `.xlsx` onto `fixphone.exe`.
+- **Send-To**: drop `fixphone.exe` (or a shortcut) into `shell:sendto` once, then right-click any file → Send To → fixphone.
+- **Double-click**: it'll ask you for a file path.
+
+The window pauses at the end so you can read the report. Save the report to CSV by running it from a terminal with `-o report.csv`.
+
+## Run it from source (no install)
 
 ```bash
 uvx fixphone contacts.xlsx
