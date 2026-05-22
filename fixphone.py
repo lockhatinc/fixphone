@@ -1,0 +1,266 @@
+"""fixphone — find busted South African telephone numbers in CSV/XLSX files.
+
+Run:  uvx fixphone INPUT.csv         # CSV (zero deps)
+      uvx fixphone INPUT.xlsx        # XLSX (pulls openpyxl)
+      pipx run fixphone INPUT.xlsx   # equivalent
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Iterator
+
+PHONE_HEADER_RE = re.compile(r"(?i)(?:^|[\s_\-/])(phone|tel(?:ephone)?|mobile|cell(?:ular)?|fax|whatsapp|msisdn|contact[\s_\-]*(?:no|num|number))(?:$|[\s_\-/])|^(phone|tel(?:ephone)?|mobile|cell(?:ular)?|fax|whatsapp|msisdn)$")
+
+# Shape gate: must look phone-ish before we even try to validate.
+# Allows digits + phone separators; optional leading +.
+SHAPE_RE = re.compile(r"^\s*\+?[\d\s\-().\/]{6,25}\s*$")
+
+# Phone-prefix gate: a bare digit blob (e.g. "8001015009087" or "20240115") is
+# NOT a phone candidate. To count, the value must have either:
+#   - a leading + (international form), or
+#   - a leading 0 or 00 (SA national or international), or
+#   - any of the typical phone separators (space, dash, dot, paren, slash).
+PHONE_PREFIX_RE = re.compile(r"^\s*(\+|0|[\d]+[\s\-().\/])")
+SEPARATOR_RE = re.compile(r"[\s\-().\/]")
+
+# Approximate set of country-code lengths we recognize for "+X..." prefix extraction.
+# We don't need a full table — anything not +27 is rejected as foreign anyway;
+# we just want to report the right country code in the reason.
+_CC_PREFIXES_1 = {"1", "7"}
+_CC_PREFIXES_2 = {"20", "27", "30", "31", "32", "33", "34", "36", "39", "40", "41", "43", "44", "45", "46", "47", "48", "49",
+                  "51", "52", "53", "54", "55", "56", "57", "58", "60", "61", "62", "63", "64", "65", "66", "81", "82", "84",
+                  "86", "90", "91", "92", "93", "94", "95", "98"}
+def _extract_cc(digits: str) -> str:
+    if digits[:1] in _CC_PREFIXES_1:
+        return digits[:1]
+    if digits[:2] in _CC_PREFIXES_2:
+        return digits[:2]
+    if digits[:3]:
+        return digits[:3]
+    return digits
+
+# SA geographic area codes (leading digit after the 0 or +27).
+# Mobile: 6, 7, 8.  Geo/landline: 1-5.  (0 and 9 are not valid SA subscriber leads.)
+SA_VALID_LEAD = set("12345678")
+
+
+@dataclass(frozen=True)
+class Result:
+    ok: bool
+    reason: str = ""
+    normalized: str = ""
+
+
+def validate_sa(raw: str) -> Result:
+    """Validate a single value as a South African phone number.
+
+    Returns ok=False with a reason when the value is *clearly a phone candidate*
+    that is busted. Returns ok=True for valid SA numbers. Returns ok=True with
+    reason="not-a-phone" for values that don't look like phones at all — the
+    caller decides whether that's a false positive based on column context.
+    """
+    if raw is None:
+        return Result(True, "empty")
+    s = str(raw).strip()
+    if not s:
+        return Result(True, "empty")
+
+    if not SHAPE_RE.match(s):
+        return Result(True, "not-a-phone")
+
+    has_plus = s.lstrip().startswith("+")
+    has_sep = bool(SEPARATOR_RE.search(s))
+    digits = re.sub(r"\D", "", s)
+
+    if not digits:
+        return Result(True, "not-a-phone")
+
+    # Phone-prefix gate (operates on digits, not raw chars, so "(082) ..." works):
+    # A phone candidate must be marked by EITHER a leading + OR digits that begin
+    # with a recognizable phone prefix (0 = national, 27 = SA, 0027 = SA international).
+    # Anything else (IDs, account numbers, dates, postal codes) is not a phone candidate
+    # — even when it has separators (e.g. "2024-01-15") or when it's just a bare blob.
+    if not has_plus:
+        if not (digits.startswith("0") or digits.startswith("27")):
+            # Sole exception: 9-digit subscriber with separators like "82 123 4567".
+            if len(digits) == 9 and digits[0] in SA_VALID_LEAD and has_sep:
+                return Result(False, "missing-leading-0-or-+27")
+            return Result(True, "not-a-phone")
+
+    # Foreign country code that isn't +27.
+    if has_plus and not digits.startswith("27"):
+        return Result(False, f"foreign-country-code:+{_extract_cc(digits)}")
+
+    # Normalize to national 0XXXXXXXXX (10 digits).
+    if digits.startswith("0027"):
+        national = "0" + digits[4:]
+    elif digits.startswith("27"):
+        national = "0" + digits[2:]
+    elif digits.startswith("0"):
+        national = digits
+    else:
+        return Result(False, f"unrecognized-prefix:{digits[:3]}")
+
+    if len(national) != 10:
+        return Result(False, f"wrong-length:{len(national)}-digits")
+
+    if national[0] != "0":
+        return Result(False, "missing-leading-0")
+
+    lead = national[1]
+    if lead not in SA_VALID_LEAD:
+        return Result(False, f"invalid-area-lead:{lead}")
+
+    return Result(True, "valid", normalized=national)
+
+
+# ---------- readers ----------
+
+def _read_csv(path: Path) -> tuple[list[str], Iterator[list[str]]]:
+    f = open(path, "r", encoding="utf-8-sig", newline="")
+    reader = csv.reader(f)
+    try:
+        header = next(reader)
+    except StopIteration:
+        header = []
+    return header, ((row) for row in reader)
+
+
+def _read_xlsx(path: Path) -> tuple[list[str], Iterator[list[str]]]:
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        sys.exit("error: reading .xlsx requires openpyxl. install with: pip install openpyxl  (or use uvx fixphone, which handles deps)")
+    wb = load_workbook(filename=str(path), read_only=True, data_only=True)
+    ws = wb.active
+    rows = ws.iter_rows(values_only=True)
+    try:
+        header_row = next(rows)
+    except StopIteration:
+        header_row = ()
+    header = ["" if v is None else str(v) for v in header_row]
+
+    def gen() -> Iterator[list[str]]:
+        for r in rows:
+            yield ["" if v is None else str(v) for v in r]
+
+    return header, gen()
+
+
+def read_table(path: Path) -> tuple[list[str], Iterator[list[str]]]:
+    ext = path.suffix.lower()
+    if ext == ".csv":
+        return _read_csv(path)
+    if ext in (".xlsx", ".xlsm"):
+        return _read_xlsx(path)
+    sys.exit(f"error: unsupported file type {ext!r}. supported: .csv .xlsx")
+
+
+# ---------- scanning ----------
+
+@dataclass
+class Busted:
+    row: int          # 1-based; row 1 = header, data starts at row 2
+    column: str
+    value: str
+    reason: str
+
+
+def pick_phone_columns(header: list[str], explicit: list[str] | None, all_columns: bool) -> list[int]:
+    if all_columns:
+        return list(range(len(header)))
+    if explicit:
+        names = {h.strip().lower(): i for i, h in enumerate(header)}
+        out = []
+        for c in explicit:
+            i = names.get(c.strip().lower())
+            if i is None:
+                sys.exit(f"error: column {c!r} not found. headers: {header}")
+            out.append(i)
+        return out
+    return [i for i, h in enumerate(header) if PHONE_HEADER_RE.search(h or "")]
+
+
+def scan(path: Path, columns: list[str] | None, all_columns: bool) -> tuple[list[Busted], int, list[str]]:
+    header, rows = read_table(path)
+    idxs = pick_phone_columns(header, columns, all_columns)
+    if not idxs:
+        # No phone columns detected and user didn't force --all-columns:
+        # refuse to scan the whole sheet — that's how false positives happen.
+        sys.exit(
+            "error: no phone-like columns found by header name.\n"
+            "  headers seen: " + ", ".join(repr(h) for h in header) + "\n"
+            "  pass --column NAME to target one, or --all-columns to scan everything (will use shape-gate)."
+        )
+
+    busted: list[Busted] = []
+    scanned = 0
+    for r, row in enumerate(rows, start=2):
+        for i in idxs:
+            if i >= len(row):
+                continue
+            val = row[i]
+            res = validate_sa(val)
+            scanned += 1
+            if res.ok:
+                continue
+            # When --all-columns, only flag values that *look* phone-shaped —
+            # the shape gate inside validate_sa already returned ok=True for
+            # non-phone strings, so anything ok=False here is a real candidate.
+            busted.append(Busted(row=r, column=header[i] if i < len(header) else f"col{i+1}",
+                                 value=str(val), reason=res.reason))
+    return busted, scanned, [header[i] if i < len(header) else f"col{i+1}" for i in idxs]
+
+
+# ---------- CLI ----------
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="fixphone",
+        description="Find busted South African telephone numbers in a CSV or XLSX file.",
+    )
+    p.add_argument("input", help="path to .csv or .xlsx file")
+    p.add_argument("--column", "-c", action="append",
+                   help="column name to scan (repeatable). default: auto-detect by header.")
+    p.add_argument("--all-columns", action="store_true",
+                   help="scan every column (uses shape gate to avoid false positives).")
+    p.add_argument("--output", "-o", help="write CSV report to this path.")
+    p.add_argument("--quiet", "-q", action="store_true", help="suppress per-row stdout output.")
+    args = p.parse_args(argv)
+
+    path = Path(args.input)
+    if not path.exists():
+        print(f"error: {path} does not exist", file=sys.stderr)
+        return 2
+
+    busted, scanned, scanned_cols = scan(path, args.column, args.all_columns)
+
+    if not args.quiet:
+        print(f"scanned {scanned} cell(s) across columns: {', '.join(scanned_cols)}")
+        if not busted:
+            print("no busted SA phone numbers found.")
+        else:
+            print(f"found {len(busted)} busted number(s):")
+            for b in busted:
+                print(f"  row {b.row}  [{b.column}]  {b.value!r}  -> {b.reason}")
+
+    if args.output:
+        with open(args.output, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["row", "column", "value", "reason"])
+            for b in busted:
+                w.writerow([b.row, b.column, b.value, b.reason])
+        if not args.quiet:
+            print(f"report written to {args.output}")
+
+    return 1 if busted else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

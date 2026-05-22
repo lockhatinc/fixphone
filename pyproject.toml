@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fixphone"
+version = "0.1.0"
+description = "Find busted South African telephone numbers in CSV and Excel files."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "lockhatinc" }]
+keywords = ["south-africa", "phone", "validation", "csv", "excel"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Office/Business",
+]
+dependencies = [
+  "openpyxl>=3.1; python_version >= '3.9'",
+]
+
+[project.scripts]
+fixphone = "fixphone:main"
+
+[project.urls]
+Homepage = "https://github.com/lockhatinc/fixphone"
+Issues = "https://github.com/lockhatinc/fixphone/issues"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["fixphone.py"]
+
+[tool.hatch.build.targets.sdist]
+include = ["fixphone.py", "README.md", "LICENSE", "tests/"]
