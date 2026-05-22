@@ -48,6 +48,7 @@ jobs:
           $rc = $LASTEXITCODE
           if ($rc -ne 1) { Write-Error "expected exit 1, got $rc"; exit 1 }
           Write-Host "smoke test passed (exit=1 as expected)"
+          exit 0
 
       - uses: actions/upload-artifact@v4
         with:
