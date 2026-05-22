@@ -42,9 +42,11 @@ jobs:
           Alice,082 123 4567
           Bob,082 123 456
           "@ | Set-Content -Encoding utf8 sample.csv
-          # Exit code 1 expected (one busted number)
-          $p = Start-Process -FilePath .\dist\fixphone.exe -ArgumentList 'sample.csv' -NoNewWindow -Wait -PassThru -RedirectStandardInput NUL
-          if ($p.ExitCode -ne 1) { Write-Error "expected exit 1, got $($p.ExitCode)"; exit 1 }
+          # stdin is non-tty in CI, so the exe's pause-at-end is automatically skipped.
+          # Exit code 1 is expected (one busted number).
+          & .\dist\fixphone.exe sample.csv
+          $rc = $LASTEXITCODE
+          if ($rc -ne 1) { Write-Error "expected exit 1, got $rc"; exit 1 }
           Write-Host "smoke test passed (exit=1 as expected)"
 
       - uses: actions/upload-artifact@v4
