@@ -83,11 +83,11 @@ def validate_sa(raw: str) -> Result:
 
     # Phone-prefix gate (operates on digits, not raw chars, so "(082) ..." works):
     # A phone candidate must be marked by EITHER a leading + OR digits that begin
-    # with a recognizable phone prefix (0 = national, 27 = SA, 0027 = SA international).
-    # Anything else (IDs, account numbers, dates, postal codes) is not a phone candidate
-    # — even when it has separators (e.g. "2024-01-15") or when it's just a bare blob.
+    # with a recognizable phone prefix (0 = national, 0027 = SA international).
+    # Bare "27..." without a + is NOT a phone — that's an account number, not an
+    # international number (the + is mandatory for international form).
     if not has_plus:
-        if not (digits.startswith("0") or digits.startswith("27")):
+        if not digits.startswith("0"):
             # Sole exception: 9-digit subscriber with separators like "82 123 4567".
             if len(digits) == 9 and digits[0] in SA_VALID_LEAD and has_sep:
                 return Result(False, "missing-leading-0-or-+27")
@@ -98,14 +98,29 @@ def validate_sa(raw: str) -> Result:
         return Result(False, f"foreign-country-code:+{_extract_cc(digits)}")
 
     # Normalize to national 0XXXXXXXXX (10 digits).
-    if digits.startswith("0027"):
-        national = "0" + digits[4:]
-    elif digits.startswith("27"):
+    if has_plus and digits.startswith("27"):
         national = "0" + digits[2:]
+    elif digits.startswith("0027"):
+        national = "0" + digits[4:]
     elif digits.startswith("0"):
         national = digits
     else:
         return Result(False, f"unrecognized-prefix:{digits[:3]}")
+
+    # Structural sanity on the raw input (catches malformed-but-right-length cases
+    # like trailing dots or wrong digit groupings).
+    stripped = s.strip()
+    if stripped and not stripped[-1].isdigit():
+        return Result(False, "trailing-non-digit")
+    # Inspect first run of digits in the raw string — for a national-format number
+    # the first run is the area code prefix; if it isn't 3 digits or the full 10,
+    # the groupings are wrong (e.g. "08 2123 4567").
+    if national[0] == "0" and not has_plus and has_sep:
+        first_run = re.match(r"\D*(\d+)", stripped)
+        if first_run:
+            n_first = len(first_run.group(1))
+            if n_first not in (3, 10):  # 082 ... or unseparated 0821234567
+                return Result(False, "malformed-grouping")
 
     if len(national) != 10:
         return Result(False, f"wrong-length:{len(national)}-digits")
@@ -291,6 +306,14 @@ def scan(path: Path, columns: list[str] | None, all_columns: bool) -> tuple[list
             "  pass --column NAME to target one, or --all-columns to scan everything (will use shape-gate)."
         )
 
+    # Strict columns are the ones the user clearly *named* as phones (explicit
+    # --column or header matched PHONE_HEADER_RE). In those, an empty cell is
+    # the only acceptable non-phone — anything else that isn't a valid SA
+    # number is busted, including garbage/extensions/stray characters.
+    # In --all-columns mode without explicit naming, fall back to the shape
+    # gate so non-phone columns (names, IDs, amounts) don't produce noise.
+    strict = set(idxs) if (columns or not all_columns) else set()
+
     busted: list[Busted] = []
     scanned = 0
     for r, row in enumerate(rows, start=2):
@@ -298,15 +321,19 @@ def scan(path: Path, columns: list[str] | None, all_columns: bool) -> tuple[list
             if i >= len(row):
                 continue
             val = row[i]
-            res = validate_sa(val)
             scanned += 1
-            if res.ok:
+            res = validate_sa(val)
+            colname = header[i] if i < len(header) else f"col{i+1}"
+            if res.ok and res.reason == "valid":
                 continue
-            # When --all-columns, only flag values that *look* phone-shaped —
-            # the shape gate inside validate_sa already returned ok=True for
-            # non-phone strings, so anything ok=False here is a real candidate.
-            busted.append(Busted(row=r, column=header[i] if i < len(header) else f"col{i+1}",
-                                 value=str(val), reason=res.reason))
+            if res.ok and res.reason == "empty":
+                continue
+            if res.ok and res.reason == "not-a-phone":
+                if i not in strict:
+                    continue
+                busted.append(Busted(row=r, column=colname, value=str(val), reason="not-a-valid-phone"))
+                continue
+            busted.append(Busted(row=r, column=colname, value=str(val), reason=res.reason))
     return busted, scanned, [header[i] if i < len(header) else f"col{i+1}" for i in idxs]
 
 

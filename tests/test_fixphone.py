@@ -206,6 +206,40 @@ def _write_minimal_xlsx(path: Path, rows: list[list[str]]) -> None:
         z.writestr("xl/worksheets/sheet1.xml", sheet)
 
 
+def test_strict_phone_column_catches_all_busted_variants(tmp_path: Path):
+    """Regression for the user-validation spreadsheet: a column explicitly
+    named for phone numbers must flag every malformed variant, not just
+    length errors. All 20 rows below should be flagged."""
+    p = _write_csv(tmp_path, [
+        ["Broken SA Phone Numbers"],
+        ["082123456"],            # short
+        ["08212345678"],          # long
+        ["+270821234567"],        # +27 then leading 0 then full number = 11 digits
+        ["27821234567"],          # no +, just 27 prefix (not international form)
+        ["082-123-456A"],         # stray letter
+        ["082 123 45 6"],         # wrong groupings + short
+        ["+28 82 123 4567"],      # foreign cc
+        ["00278212345678"],       # too long
+        ["821234567"],            # bare 9-digit blob
+        ["082!1234567"],          # bad separator
+        ["+27 (0) 82 123 45678"], # spurious (0) makes it too long
+        ["08 2123 4567"],         # malformed groupings (10 digits)
+        ["+27-82-123-456"],       # short under +27
+        ["082_123_4567"],         # underscore not a phone sep
+        ["+27821234567a"],        # trailing alpha
+        ["082.123.4567."],        # trailing dot
+        ["082123"],               # way too short
+        ["+27 82 123 4567 890"],  # too long
+        ["082 123 4567 ext 123"], # extension text
+        ["(082) 123-456"],        # short
+    ])
+    busted, scanned, cols = scan(p, columns=None, all_columns=False)
+    assert cols == ["Broken SA Phone Numbers"]
+    assert scanned == 20
+    assert len(busted) == 20, f"expected 20 busted, got {len(busted)}: " + \
+        ", ".join(f"row{b.row}={b.value!r}({b.reason})" for b in busted)
+
+
 def test_scan_xlsx_stdlib_reader(tmp_path: Path):
     p = tmp_path / "sample.xlsx"
     _write_minimal_xlsx(p, [
