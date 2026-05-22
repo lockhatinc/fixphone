@@ -7,3 +7,5 @@ build/
 .venv/
 venv/
 .gm/
+config.bat
+node_modules

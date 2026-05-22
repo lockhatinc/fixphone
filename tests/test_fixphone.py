@@ -206,6 +206,23 @@ def _write_minimal_xlsx(path: Path, rows: list[list[str]]) -> None:
         z.writestr("xl/worksheets/sheet1.xml", sheet)
 
 
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.mark.parametrize("fname", ["file1_70_broken.xlsx", "file2_70_broken.xlsx"])
+def test_user_fixtures_yield_exactly_70_busted(fname):
+    """The user-supplied validation spreadsheets must each yield exactly 70
+    busted entries. The second file adds non-phone noise (decimals, currency,
+    units, sci-notation, #ERROR!) that must NOT inflate the count."""
+    p = FIXTURES / fname
+    if not p.exists():
+        pytest.skip(f"fixture missing: {p}")
+    busted, _, _ = scan(p, columns=None, all_columns=False)
+    assert len(busted) == 70, \
+        f"{fname}: expected 70 busted, got {len(busted)}: " + \
+        ", ".join(f"row{b.row}={b.value!r}" for b in busted[:5]) + " ..."
+
+
 def test_strict_phone_column_catches_all_busted_variants(tmp_path: Path):
     """Regression for the user-validation spreadsheet: a column explicitly
     named for phone numbers must flag every malformed variant, not just

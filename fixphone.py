@@ -36,6 +36,59 @@ _CC_PREFIXES_1 = {"1", "7"}
 _CC_PREFIXES_2 = {"20", "27", "30", "31", "32", "33", "34", "36", "39", "40", "41", "43", "44", "45", "46", "47", "48", "49",
                   "51", "52", "53", "54", "55", "56", "57", "58", "60", "61", "62", "63", "64", "65", "66", "81", "82", "84",
                   "86", "90", "91", "92", "93", "94", "95", "98"}
+def _looks_like_phone_attempt(s: str) -> bool:
+    """A value is a phone-entry attempt if it has phone-like shape: leading +,
+    leading 0, parenthesized leading 0, OR a digit-only blob whose shape
+    matches a recognizable SA pattern (starts with 27 / 0027 / SA mobile lead
+    digit and falls in 9-12 digit range). Pure non-phone strings like
+    '#ERROR!', short numerics like '12345.0', or generic digit blobs starting
+    with 9 or non-SA leads are not phone-entry attempts."""
+    s = s.strip()
+    if not s:
+        return False
+    # Excel scientific notation: only treat as a phone attempt if decoding to
+    # an integer yields something phone-shaped (10-12 digits starting with 27,
+    # or 11+ digits — phones are typically 9-12 digits total, anything shorter
+    # is a tiny number). Excel mangles long phone-like integers into
+    # '2.782123456E9' form. A real fractional number like '3.14159' has very
+    # few digits and decodes to '3', so it won't be misclassified.
+    sci = re.fullmatch(r"-?\d+\.\d+[eE][+-]?\d+", s) or re.fullmatch(r"-?\d+[eE][+-]?\d+", s)
+    if sci:
+        try:
+            n = abs(int(float(s)))
+        except (ValueError, OverflowError):
+            return False
+        d = str(n)
+        if d.startswith("27") and 10 <= len(d) <= 12:
+            return True
+        if len(d) >= 10 and d[0] in "678":
+            return True
+        return False
+    # Pure numeric literals (decimals, currency-like) are data-noise.
+    if re.fullmatch(r"-?\d+\.\d+", s):
+        return False
+    if re.fullmatch(r"-?\d+\.0+", s):  # Excel-style "100.0"
+        return False
+    if re.fullmatch(r"[#].+[!]?", s):   # '#ERROR!', '#N/A'
+        return False
+    digits = re.sub(r"\D", "", s)
+    lead = s.lstrip("(").lstrip()
+    # Phone-shape lead beats currency/unit detection: '082 123 4567 ext 123'
+    # is a phone attempt, but '£20' or '50kg' are not.
+    if lead.startswith("+") or lead.startswith("0"):
+        return True
+    if re.match(r"^[£$€¥]", s) or re.search(r"\d\s*[a-zA-Z]{1,3}$", s):
+        return False
+    # Pure-digit attempts (Excel may have stripped formatting/leading 0/+).
+    if digits.startswith("0027") and 12 <= len(digits) <= 14:
+        return True
+    if digits.startswith("27") and 10 <= len(digits) <= 12:
+        return True
+    if len(digits) in (9, 10) and digits[:1] in "678":
+        return True
+    return False
+
+
 def _extract_cc(digits: str) -> str:
     if digits[:1] in _CC_PREFIXES_1:
         return digits[:1]
@@ -307,11 +360,11 @@ def scan(path: Path, columns: list[str] | None, all_columns: bool) -> tuple[list
         )
 
     # Strict columns are the ones the user clearly *named* as phones (explicit
-    # --column or header matched PHONE_HEADER_RE). In those, an empty cell is
-    # the only acceptable non-phone — anything else that isn't a valid SA
-    # number is busted, including garbage/extensions/stray characters.
-    # In --all-columns mode without explicit naming, fall back to the shape
-    # gate so non-phone columns (names, IDs, amounts) don't produce noise.
+    # --column or header matched PHONE_HEADER_RE). In those, anything with
+    # phone-attempt shape that isn't a valid SA number is busted. Values that
+    # clearly aren't phone-entry attempts (#ERROR! cells, short numerics,
+    # bare digit blobs without SA shape) are not flagged — they're noise that
+    # belongs in a phone column by mistake, not broken phone entries.
     strict = set(idxs) if (columns or not all_columns) else set()
 
     busted: list[Busted] = []
@@ -331,7 +384,14 @@ def scan(path: Path, columns: list[str] | None, all_columns: bool) -> tuple[list
             if res.ok and res.reason == "not-a-phone":
                 if i not in strict:
                     continue
+                if not _looks_like_phone_attempt(str(val)):
+                    continue
                 busted.append(Busted(row=r, column=colname, value=str(val), reason="not-a-valid-phone"))
+                continue
+            # validate_sa returned busted, but in strict mode we still verify
+            # the value was actually a phone-entry attempt — otherwise we'd
+            # flag decimal noise like '0.5' that trips length/grouping checks.
+            if i in strict and not _looks_like_phone_attempt(str(val)):
                 continue
             busted.append(Busted(row=r, column=colname, value=str(val), reason=res.reason))
     return busted, scanned, [header[i] if i < len(header) else f"col{i+1}" for i in idxs]
